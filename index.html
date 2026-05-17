@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>🍺 供应链啤酒游戏 — 牛鞭效应模拟器</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
   <style>
     /* ===== CSS 变量 ===== */
     :root {
@@ -637,7 +638,34 @@
 
   <!-- 多人模式面板 -->
   <div id="multi-panel" class="hidden">
-    <div class="info-notice">⚠️ 多人模式仅支持同一设备上的多个浏览器标签页。跨设备联机需要后端服务器支持。</div>
+    <!-- Supabase 配置区 -->
+    <div id="supabase-config-area" style="margin-bottom:16px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <span style="font-size:.875rem;font-weight:700;color:var(--blue-deep);">🌐 联机后端（Supabase Realtime）</span>
+        <button class="btn btn-sm btn-outline" id="btn-toggle-config">⚙️ 配置</button>
+      </div>
+      <div id="supabase-status-bar" style="background:var(--gray-100);border-radius:var(--radius-sm);padding:8px 12px;font-size:.82rem;color:var(--gray-600);">
+        状态：<span id="sb-status-text">未配置（使用同设备模式）</span>
+      </div>
+      <div id="supabase-form" class="hidden" style="margin-top:12px;background:var(--white);border:1.5px solid var(--gray-200);border-radius:var(--radius-sm);padding:16px;">
+        <div class="info-notice" style="margin-bottom:12px;">
+          填入您的 <strong>Supabase Project URL</strong> 和 <strong>anon key</strong>，即可跨设备联机。<br>
+          前往 <a href="https://supabase.com" target="_blank" style="color:var(--blue-mid);">supabase.com</a> 免费注册 → 创建项目 → Settings → API 中获取。
+        </div>
+        <div class="input-group">
+          <label>Project URL（如 https://xxxx.supabase.co）</label>
+          <input type="text" id="sb-url-input" placeholder="https://xxxxxxxxxx.supabase.co">
+        </div>
+        <div class="input-group">
+          <label>anon key（公开密钥，以 eyJ 开头）</label>
+          <input type="text" id="sb-key-input" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...">
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-primary btn-sm" id="btn-sb-connect">🔌 连接</button>
+          <button class="btn btn-outline btn-sm" id="btn-sb-clear">🗑️ 清除</button>
+        </div>
+      </div>
+    </div>
     <div class="panel-tabs">
       <button class="panel-tab active" data-tab="create">创建房间</button>
       <button class="panel-tab" data-tab="join">加入房间</button>
@@ -835,7 +863,10 @@ const CONFIG = {
 let GS = null;  // GameState
 let mode = null;  // 'single' | 'multi'
 let playerRole = null;
-let multiChannel = null;
+let multiChannel = null;   // BroadcastChannel（同设备备用）
+let sbChannel = null;      // Supabase Realtime Channel（跨设备）
+let sbClient = null;       // Supabase client
+let useSupabase = false;   // 是否使用 Supabase 模式
 let isHost = false;
 let multiGameId = null;
 let connectedRoles = new Set();
@@ -1445,25 +1476,64 @@ function startSingleGame(role) {
   updateCardsUI();
 }
 
-// ===== 多人模式：BroadcastChannel =====
-function setupMultiChannel(gameId) {
-  if (multiChannel) multiChannel.close();
-  multiChannel = new BroadcastChannel(`beer-game-${gameId}`);
-  multiChannel.onmessage = handleMultiMessage;
+// ===== 多人模式：通信层（Supabase Realtime + BroadcastChannel 双模式）=====
+
+// --- Supabase 初始化 ---
+function initSupabase(url, key) {
+  try {
+    sbClient = supabase.createClient(url.trim(), key.trim());
+    useSupabase = true;
+    $('sb-status-text').textContent = `已连接：${url.replace('https://', '').split('.')[0]}.supabase.co`;
+    $('sb-status-text').style.color = 'var(--green)';
+    showToast('Supabase 连接成功，现在支持跨设备联机！');
+    localStorage.setItem('sb_url', url.trim());
+    localStorage.setItem('sb_key', key.trim());
+    return true;
+  } catch(e) {
+    showToast('Supabase 连接失败：' + e.message);
+    return false;
+  }
 }
 
-function handleMultiMessage(event) {
-  const msg = event.data;
+// --- 统一建立频道 ---
+function setupMultiChannel(gameId) {
+  if (sbChannel) { sbChannel.unsubscribe(); sbChannel = null; }
+  if (multiChannel) { multiChannel.close(); multiChannel = null; }
+
+  if (useSupabase && sbClient) {
+    sbChannel = sbClient.channel(`beer-game-${gameId}`, {
+      config: { broadcast: { self: false } }
+    });
+    sbChannel
+      .on('broadcast', { event: '*' }, ({ event, payload }) => {
+        handleMultiMessage({ type: event, ...payload });
+      })
+      .subscribe();
+  } else {
+    multiChannel = new BroadcastChannel(`beer-game-${gameId}`);
+    multiChannel.onmessage = (e) => handleMultiMessage(e.data);
+  }
+}
+
+// --- 统一发送消息 ---
+function broadcastMsg(msg) {
+  const { type, ...payload } = msg;
+  if (useSupabase && sbChannel) {
+    sbChannel.send({ type: 'broadcast', event: type, payload });
+  } else if (multiChannel) {
+    multiChannel.postMessage(msg);
+  }
+}
+
+// --- 消息处理（逻辑不变，只是入口统一了）---
+function handleMultiMessage(msg) {
   if (!msg || !msg.type) return;
 
   switch (msg.type) {
     case 'JOIN': {
       if (!isHost) return;
-      const role = msg.role;
-      connectedRoles.add(role);
-      // 更新等待室
+      connectedRoles.add(msg.role);
       updateWaitingRoom();
-      // 广播当前连接状态
       broadcastMsg({ type: 'CONNECTED_ROLES', roles: [...connectedRoles] });
       break;
     }
@@ -1474,7 +1544,6 @@ function handleMultiMessage(event) {
       break;
     }
     case 'START_GAME': {
-      // 非房主收到开始信号
       GS = msg.state;
       aiPredictions = [4, 4, 4, 4];
       mode = 'multi';
@@ -1498,7 +1567,6 @@ function handleMultiMessage(event) {
     }
     case 'ORDER_SUBMIT': {
       if (!isHost) return;
-      // 房主收到某玩家的订单
       pendingOrders[msg.role] = msg.order;
       checkAndSettleMulti();
       break;
@@ -1508,28 +1576,20 @@ function handleMultiMessage(event) {
 
 let pendingOrders = {};
 function checkAndSettleMulti() {
-  // 检查是否所有"人类"玩家都已提交
   const humanRoles = [...connectedRoles];
   const allSubmitted = humanRoles.every(r => pendingOrders[r] !== undefined);
   if (!allSubmitted) return;
 
-  // AI填补剩余角色
-  const orders = [0, 1, 2, 3].map(i => {
-    if (pendingOrders[i] !== undefined) return pendingOrders[i];
-    return aiDecide(i, GS);
-  });
+  const orders = [0, 1, 2, 3].map(i =>
+    pendingOrders[i] !== undefined ? pendingOrders[i] : aiDecide(i, GS)
+  );
   pendingOrders = {};
 
   settleRound(orders);
-  // 广播新状态
   broadcastMsg({ type: 'STATE_SYNC', state: GS });
   updateCardsUI();
   updateCharts();
   if (GS.finished) showSummary();
-}
-
-function broadcastMsg(msg) {
-  if (multiChannel) multiChannel.postMessage(msg);
 }
 
 function updateWaitingRoom() {
@@ -1580,6 +1640,41 @@ function submitMultiOrder() {
 
 // ===== 事件绑定 =====
 document.addEventListener('DOMContentLoaded', () => {
+  // --- Supabase 配置 ---
+  // 读取 localStorage 中的已保存配置
+  const savedUrl = localStorage.getItem('sb_url');
+  const savedKey = localStorage.getItem('sb_key');
+  if (savedUrl && savedKey) {
+    $('sb-url-input').value = savedUrl;
+    $('sb-key-input').value = savedKey;
+    initSupabase(savedUrl, savedKey);
+  }
+
+  $('btn-toggle-config').addEventListener('click', () => {
+    $('supabase-form').classList.toggle('hidden');
+  });
+
+  $('btn-sb-connect').addEventListener('click', () => {
+    const url = $('sb-url-input').value.trim();
+    const key = $('sb-key-input').value.trim();
+    if (!url || !key) { showToast('请填写 Project URL 和 anon key'); return; }
+    if (initSupabase(url, key)) {
+      $('supabase-form').classList.add('hidden');
+    }
+  });
+
+  $('btn-sb-clear').addEventListener('click', () => {
+    localStorage.removeItem('sb_url');
+    localStorage.removeItem('sb_key');
+    useSupabase = false;
+    sbClient = null;
+    $('sb-url-input').value = '';
+    $('sb-key-input').value = '';
+    $('sb-status-text').textContent = '未配置（使用同设备模式）';
+    $('sb-status-text').style.color = '';
+    showToast('已清除 Supabase 配置，切换回同设备模式');
+  });
+
   // 首页
   $('btn-single-mode').addEventListener('click', () => {
     $('role-select-panel').classList.remove('hidden');
@@ -1627,7 +1722,8 @@ document.addEventListener('DOMContentLoaded', () => {
     $('room-code-display').style.display = 'block';
     $('waiting-room').style.display = 'block';
     updateWaitingRoom();
-    showToast(`🏠 房间 ${multiGameId} 已创建，等待其他玩家加入...`);
+    const modeLabel = useSupabase ? '（跨设备联机）' : '（同设备模式）';
+    showToast(`🏠 房间 ${multiGameId} 已创建 ${modeLabel}`);
   });
 
   // 加入房间
@@ -1639,8 +1735,10 @@ document.addEventListener('DOMContentLoaded', () => {
     multiGameId = code;
     isHost = false;
     setupMultiChannel(code);
-    // 发送加入消息
-    broadcastMsg({ type: 'JOIN', role });
+    // 稍等 channel 订阅就绪后再发 JOIN（Supabase 需要等 subscribe 完成）
+    setTimeout(() => {
+      broadcastMsg({ type: 'JOIN', role });
+    }, useSupabase ? 800 : 0);
     $('waiting-room').style.display = 'block';
     showToast(`🔗 已加入房间 ${code}，等待房主开始...`);
   });
@@ -1670,6 +1768,7 @@ document.addEventListener('DOMContentLoaded', () => {
     mode = null;
     aiPredictions = [4, 4, 4, 4];
     if (multiChannel) { multiChannel.close(); multiChannel = null; }
+    if (sbChannel) { sbChannel.unsubscribe(); sbChannel = null; }
     $('round-badge').classList.add('hidden');
     $('progress-bar-wrap').classList.add('hidden');
     $('role-select-panel').classList.add('hidden');
